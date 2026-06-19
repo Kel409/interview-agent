@@ -1,0 +1,6 @@
+# Core framework. The extras cover everything this agent uses:
+#   silero        -> local voice-activity detection (used for endpointing/turn-taking)
+#   turn-detector -> better end-of-turn detection
+#   openai        -> only needed if you switch to the direct OpenAI plugin (Option B in the README)
+livekit-agents[openai,silero,turn-detector]>=1.6
+python-dotenv>=1.0

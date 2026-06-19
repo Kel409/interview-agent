@@ -1,0 +1,26 @@
+# Secrets / local config
+.env
+
+# Generated interview reports (local output)
+interview_reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling / OS
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/
