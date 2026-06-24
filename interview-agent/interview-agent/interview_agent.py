@@ -37,13 +37,30 @@ from livekit.agents import (
     ChatContext,
     JobContext,
     RunContext,
+    MetricsCollectedEvent,
     UserInputTranscribedEvent,
     UserStateChangedEvent,
     cli,
     inference,
+    metrics,
+    room_io,
 )
 from livekit.agents.llm import function_tool
 from livekit.agents import llm
+
+# Background-noise cancellation is optional: if the plugin isn't installed the
+# agent still runs, just without it. (pip install "livekit-plugins-noise-cancellation")
+try:
+    from livekit.plugins import noise_cancellation
+except ImportError:
+    noise_cancellation = None
+
+# Silero VAD lets us tune how sensitive speech detection is (see VAD_ACTIVATION_THRESHOLD).
+# If it isn't installed, the session falls back to its default VAD.
+try:
+    from livekit.plugins import silero
+except ImportError:
+    silero = None
 
 logger = logging.getLogger("interview-agent")
 load_dotenv()
@@ -99,6 +116,45 @@ TTS_MODEL = "cartesia/sonic-3"
 # Voice ID for the TTS model above. Different voices change the interviewer's
 # perceived personality, so this is worth experimenting with.
 TTS_VOICE = "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+
+# --- Responsiveness / background noise ---
+# Krisp background-voice/noise cancellation. Background noise can be mistaken for
+# the candidate still talking, which makes the agent wait (up to ENDPOINTING_MAX_DELAY)
+# before replying -- the main cause of laggy responses in a noisy room. This removes
+# it at the source. Requires LiveKit Cloud + the livekit-plugins-noise-cancellation
+# package, and only applies when connected to a room (dev mode), not console mode.
+ENABLE_NOISE_CANCELLATION = True
+# Let the agent start forming its reply while it's still waiting to confirm the
+# candidate has finished -- cuts perceived latency. Safe to leave on.
+ENABLE_PREEMPTIVE_GENERATION = True
+# The longest the agent will wait after the candidate stops speaking before it
+# decides the turn is over (seconds). Lower = snappier replies, but too low and it
+# may cut off candidates who pause mid-sentence. Framework default is 3.0.
+ENDPOINTING_MAX_DELAY = 3.0
+# The *shortest* wait after the candidate stops before the turn can be declared
+# done. This is the most direct "respond faster" dial: lowering it (e.g. 0.3)
+# noticeably cuts the pause, at some risk of jumping in on brief pauses. Default 0.5.
+ENDPOINTING_MIN_DELAY = 0.5
+# How loud/confident an audio frame must be to START counting as speech (0-1).
+# The default (0.5) lets background noise through. Raising it makes the agent
+# ignore quieter noise. Too high and it may miss a soft speaker.
+VAD_ACTIVATION_THRESHOLD = 0.7
+# How quiet it must get to STOP counting as speech once started (0-1). This is the
+# key dial for noisy rooms: if your background noise sits above this, the detector
+# keeps "hearing" you and never ends your turn. Raising it (closer to the activation
+# threshold) makes the agent decide you've stopped sooner. Too high and it may clip
+# the quiet ends of your sentences. Must be > 0 and below the activation threshold.
+VAD_DEACTIVATION_THRESHOLD = 0.55
+# Fallback for unavoidable background noise: if the candidate has spoken words but
+# no NEW words arrive for this many seconds while their turn still hasn't closed
+# (because noise keeps the voice detector "hearing" them), force the turn closed and
+# reply anyway. Keep this comfortably longer than ENDPOINTING_MAX_DELAY so it only
+# kicks in when normal endpointing has clearly failed -- otherwise it could cut off a
+# candidate who simply pauses to think. Set to 0 to disable.
+NO_NEW_WORDS_TIMEOUT = 8.0
+# Log a per-turn latency breakdown (end-of-utterance delay, LLM time-to-first-token,
+# TTS time-to-first-byte) so you can see WHERE a pause comes from. Turn off for quiet logs.
+LOG_LATENCY_METRICS = True
 
 # Where the post-interview report is saved.
 REPORT_DIR = Path("interview_reports")
@@ -376,19 +432,49 @@ async def entrypoint(ctx: JobContext) -> None:
     # The session ties together the ears (STT), brain (LLM), and voice (TTS),
     # and carries our shared InterviewData. user_away_timeout drives the
     # silence detection used below.
+    # A less noise-sensitive VAD so background sound doesn't get mistaken for the
+    # candidate still talking (the main cause of long pauses, especially in console
+    # mode). Only passed when the plugin is installed; otherwise the session uses
+    # its default VAD.
+    extra_session_kwargs = {}
+    if silero is not None:
+        extra_session_kwargs["vad"] = silero.VAD.load(
+            activation_threshold=VAD_ACTIVATION_THRESHOLD,
+            deactivation_threshold=VAD_DEACTIVATION_THRESHOLD,
+        )
+
     session = AgentSession[InterviewData](
         stt=inference.STT(STT_MODEL),
         llm=inference.LLM(LLM_MODEL),
         tts=inference.TTS(TTS_MODEL, voice=TTS_VOICE),
         userdata=InterviewData(),
         user_away_timeout=USER_AWAY_TIMEOUT,
-        # Give slower (tool-using) replies time to be scheduled before the
-        # framework judges a barge-in to be a false interruption. See the note
-        # on FALSE_INTERRUPTION_TIMEOUT above.
+        # Give slower replies time to be scheduled before a barge-in is judged a
+        # false interruption (see FALSE_INTERRUPTION_TIMEOUT), let the agent start
+        # generating before the turn is confirmed (lower latency), and cap how long
+        # it waits to call the turn done.
         turn_handling={
             "interruption": {"false_interruption_timeout": FALSE_INTERRUPTION_TIMEOUT},
+            "preemptive_generation": {"enabled": ENABLE_PREEMPTIVE_GENERATION},
+            "endpointing": {
+                "min_delay": ENDPOINTING_MIN_DELAY,
+                "max_delay": ENDPOINTING_MAX_DELAY,
+            },
         },
+        **extra_session_kwargs,
     )
+
+    # --- Latency metrics --------------------------------------------------
+    # Logs a breakdown for each turn so you can see where a pause actually is:
+    #   EOU (end_of_utterance_delay) -> how long after the candidate stopped before
+    #       their turn was declared done. High here = endpointing / turn detection
+    #       (often background noise keeping the turn "open").
+    #   LLM ttft  -> time for the model to start replying.
+    #   TTS ttfb  -> time for the first audio to come back.
+    if LOG_LATENCY_METRICS:
+        @session.on("metrics_collected")
+        def _on_metrics(ev: MetricsCollectedEvent) -> None:
+            metrics.log_metrics(ev.metrics)
 
     # --- Silence / no-answer handling -------------------------------------
     # When the candidate stops responding, gently check in a few times, then
@@ -463,6 +549,55 @@ async def entrypoint(ctx: JobContext) -> None:
     # inactivity state above and shared between both subsystems.)
     pending_clarity_task: asyncio.Task | None = None
 
+    # --- No-new-words watchdog --------------------------------------------
+    # Rescue for unavoidable background noise: the candidate's words stop, but the
+    # voice detector keeps "hearing" noise so their turn never closes and the agent
+    # never replies. We track when words last arrived; if NO_NEW_WORDS_TIMEOUT passes
+    # with the turn still open, we force it closed (commit_user_turn) so the agent
+    # responds to what it did hear.
+    words_timeout_task: asyncio.Task | None = None
+    pending_user_words = False
+
+    async def _force_commit_after_quiet() -> None:
+        try:
+            await asyncio.sleep(NO_NEW_WORDS_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if not pending_user_words:
+            return  # turn already closed normally
+        logger.info(
+            "No new words for %.0fs but the turn is still open -- asking the framework "
+            "to close it so the agent can respond.",
+            NO_NEW_WORDS_TIMEOUT,
+        )
+        # Backstop only. This nudges the framework to end the turn, but the turn-end
+        # still waits for the voice detector to settle, so when background noise is
+        # continuous this can't fully force an instant reply -- the real fix for that
+        # is the VAD thresholds above (and, ideally, cleaner audio). It does guarantee
+        # the turn eventually closes rather than hanging forever.
+        try:
+            session.commit_user_turn()
+        except RuntimeError:
+            pass  # session not running / nothing to commit
+
+    def _arm_words_watchdog() -> None:
+        # Called each time real words arrive; (re)starts the timer so it measures
+        # time since the LAST word. Disabled when NO_NEW_WORDS_TIMEOUT <= 0.
+        nonlocal words_timeout_task, pending_user_words
+        if NO_NEW_WORDS_TIMEOUT <= 0:
+            return
+        pending_user_words = True
+        if words_timeout_task is not None and not words_timeout_task.done():
+            words_timeout_task.cancel()
+        words_timeout_task = asyncio.create_task(_force_commit_after_quiet())
+
+    def _disarm_words_watchdog() -> None:
+        nonlocal words_timeout_task, pending_user_words
+        pending_user_words = False
+        if words_timeout_task is not None and not words_timeout_task.done():
+            words_timeout_task.cancel()
+            words_timeout_task = None
+
     async def handle_recognition_trouble(reason: str) -> None:
         nonlocal handling_trouble
         if handling_trouble:
@@ -528,7 +663,12 @@ async def entrypoint(ctx: JobContext) -> None:
             return
         words = ev.transcript.strip().split()
         if len(words) >= MIN_WORDS_FOR_VALID_ANSWER:
-            return  # understood -> the reset below (conversation_item_added) handles it
+            # Real words arrived -> (re)start the no-new-words watchdog. If the turn
+            # closes normally, _on_item_added disarms it; if noise keeps the turn open,
+            # the watchdog forces a reply. The conversation_item_added reset below
+            # handles the recognition-trouble streak.
+            _arm_words_watchdog()
+            return
         if _trouble_debounced():
             return
         asyncio.create_task(handle_recognition_trouble("not_understood"))
@@ -568,6 +708,8 @@ async def entrypoint(ctx: JobContext) -> None:
         if item.type == "message" and item.role == "user" and item.text_content.strip():
             last_user_turn_at = time.monotonic()
             session.userdata.recognition_failures = 0
+            # The turn closed (normally or via the watchdog) -> stand the watchdog down.
+            _disarm_words_watchdog()
             if pending_clarity_task is not None and not pending_clarity_task.done():
                 pending_clarity_task.cancel()
                 pending_clarity_task = None
@@ -578,7 +720,17 @@ async def entrypoint(ctx: JobContext) -> None:
     # Write the report whenever the session ends, however it ends.
     ctx.add_shutdown_callback(lambda: asyncio.to_thread(write_report, session))
 
-    await session.start(agent=IntroductionAgent(), room=ctx.room)
+    # Turn on noise cancellation if it's enabled and the plugin is installed.
+    # (Has no effect in console mode, where there's no room to filter.)
+    start_kwargs = {}
+    if ENABLE_NOISE_CANCELLATION and noise_cancellation is not None:
+        start_kwargs["room_options"] = room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=noise_cancellation.BVC(),
+            ),
+        )
+
+    await session.start(agent=IntroductionAgent(), room=ctx.room, **start_kwargs)
 
 
 if __name__ == "__main__":
