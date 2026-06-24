@@ -122,6 +122,14 @@ Everything adjustable is in the `CONFIG` block at the top of `interview_agent.py
 | `STT_MODEL` / `LLM_MODEL` / `TTS_MODEL` / `TTS_VOICE` | Deepgram / OpenAI / Cartesia | Which models/voice to use |
 | `USER_AWAY_TIMEOUT` | `30.0` | Seconds of silence before the agent checks in (kept high for think-time) |
 | `MAX_REPROMPTS` | `2` | How many times it checks in before ending |
+| `ENABLE_NOISE_CANCELLATION` | `True` | Filter background noise so it isn't mistaken for speech (needs LiveKit Cloud + the noise-cancellation package; applies in `dev`/room mode, not `console`) |
+| `VAD_ACTIVATION_THRESHOLD` | `0.7` | How loud audio must be to *start* counting as speech. Raise it so background noise doesn't trigger the detector. Too high may miss a soft speaker |
+| `VAD_DEACTIVATION_THRESHOLD` | `0.55` | How quiet it must get to *stop* counting as speech. The key dial for noisy rooms — if noise sits above it, your turn never ends. Raise toward the activation threshold to end turns sooner |
+| `NO_NEW_WORDS_TIMEOUT` | `8.0` | Fallback for unavoidable noise: if words stop but the turn won't close, force a reply after this many seconds. Keep it above `ENDPOINTING_MAX_DELAY`. `0` disables it |
+| `ENABLE_PREEMPTIVE_GENERATION` | `True` | Start forming the reply before the turn is confirmed, to cut latency |
+| `ENDPOINTING_MAX_DELAY` | `3.0` | Longest wait after the candidate stops before replying (lower = snappier, but risks cutting them off) |
+| `ENDPOINTING_MIN_DELAY` | `0.5` | Shortest wait before a turn can be declared done — the most direct "respond faster" dial |
+| `LOG_LATENCY_METRICS` | `True` | Log a per-turn latency breakdown (EOU delay, LLM TTFT, TTS TTFB) to see where any pause is |
 | `MAX_RECOGNITION_FAILURES` | `3` | Failed/garbled attempts before offering a typed fallback / ending |
 | `MIN_WORDS_FOR_VALID_ANSWER` | `1` | Transcripts shorter than this count as "didn't catch it" |
 | `TROUBLE_DEBOUNCE` | `1.5` | Collapses bursts of trouble events into one |
@@ -169,7 +177,6 @@ a web frontend.
 ## License
 
 [MIT](Kenneth Lin).
-
 ## Acknowledgements
 
 Built on [LiveKit Agents](https://github.com/livekit/agents) (Apache-2.0). See their

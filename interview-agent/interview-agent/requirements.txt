@@ -3,4 +3,9 @@
 #   turn-detector -> better end-of-turn detection
 #   openai        -> only needed if you switch to the direct OpenAI plugin (Option B in the README)
 livekit-agents[openai,silero,turn-detector]>=1.6
+
+# Background-noise cancellation (Krisp BVC). Optional but recommended -- it's the
+# main fix for the agent lagging in a noisy room. The agent runs without it too.
+livekit-plugins-noise-cancellation
+
 python-dotenv>=1.0
