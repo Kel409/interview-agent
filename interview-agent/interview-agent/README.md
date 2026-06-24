@@ -68,7 +68,7 @@ report is extracted once at the end from the transcript.
 ## Setup
 
 ```bash
-git clone https://github.com/<you>/interview-agent.git
+git clone https://github.com/Kel409/interview-agent.git
 cd interview-agent
 
 python -m venv .venv
@@ -176,8 +176,7 @@ a web frontend.
 
 ## License
 
-[MIT](LICENSE). Update the copyright holder in the `LICENSE` file.
-
+[MIT](Kenneth Lin).
 ## Acknowledgements
 
 Built on [LiveKit Agents](https://github.com/livekit/agents) (Apache-2.0). See their
